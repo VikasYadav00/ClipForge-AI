@@ -1,0 +1,115 @@
+version: '3.9'
+
+services:
+  # ── PostgreSQL Database ──────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: clipforge_postgres
+    environment:
+      POSTGRES_USER: clipforge
+      POSTGRES_PASSWORD: clipforge_secret
+      POSTGRES_DB: clipforge
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clipforge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis (task queue & cache) ───────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: clipforge_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── FastAPI Backend ──────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: clipforge_backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://clipforge:clipforge_secret@postgres:5432/clipforge
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./storage:/app/storage
+      - ./backend:/app
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  # ── Celery Worker ────────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: clipforge_worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://clipforge:clipforge_secret@postgres:5432/clipforge
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./storage:/app/storage
+      - ./backend:/app
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
+
+  # ── Celery Beat (scheduler) ──────────────────────────────────────────────────
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: clipforge_beat
+    depends_on:
+      - worker
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://clipforge:clipforge_secret@postgres:5432/clipforge
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+    command: celery -A app.workers.celery_app beat --loglevel=info
+
+  # ── Next.js Frontend ─────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: clipforge_frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_URL: http://backend:8000
+      BACKEND_INTERNAL_URL: http://backend:8000
+
+volumes:
+  postgres_data:
+  redis_data:
